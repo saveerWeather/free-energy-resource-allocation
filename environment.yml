@@ -4,6 +4,7 @@ channels:
   - openbiosim/label/dev
 dependencies:
   - python=3.11
+  - cuda-version=13.2    # must not exceed the driver's CUDA (nvidia-smi); 13.5 broke OpenMM CUDA
   - biosimspace>2023.4   
   - gromacs              
   - ambertools         
