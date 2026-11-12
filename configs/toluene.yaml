@@ -1,0 +1,13 @@
+name: toluene
+smiles: "Cc1ccccc1"
+
+replicates: 5         
+ns_per_tape: 5.0      
+equil_ps: 1000       
+
+workdir: /workspace/runs   # on the volume, not in git
+
+# Filled in after printing a3fe's defaults + adding midpoints
+lambda:
+  discharge: []
+  vanish: []
