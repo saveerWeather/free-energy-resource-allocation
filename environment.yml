@@ -1,0 +1,21 @@
+name: fera
+channels:
+  - conda-forge
+  - openbiosim/label/dev
+dependencies:
+  - python=3.11
+  - biosimspace>2023.4   
+  - gromacs              
+  - ambertools         
+  - rdkit                
+  - pymbar<4           
+  - alchemlyb=1.0.1      
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - arviz
+  - pydantic
+  - pyyaml
+  - loguru
+  - pip
