@@ -1,153 +1,260 @@
 """
-Build an equilibrated ligand-in-water system with a3fe's protocol, then write one
-SOMD run folder per (stage, λ, replicate), all on the dense λ grid.
+Build equilibrated systems with a3fe's protocol, then write one SOMD run folder per
+(leg, stage, λ, replicate), each stage on its own dense λ grid.
 
-    python sims/prep.py configs/toluene.yaml
+    python sims/prep.py configs/toluene.yaml     # free leg only, from SMILES
+    python sims/prep.py configs/mdm2.yaml        # bound + free, from a3fe's example inputs
+
+Two config shapes:
+  - legacy (toluene): top-level `lambda: {stage: grid}` -> one free leg, folders at
+    {base}/{stage}/lambda_X/rep_R (what notebooks/replay.ipynb reads).
+  - `legs: {bound: {stage: grid}, free: {...}}` -> folders at
+    {base}/{leg}/{stage}/lambda_X/rep_R.
 
 Resumable: every step is skipped if its output already exists. Mirrors a3fe's
-Leg.setup -> Leg.setup_stages -> LambdaWindow/Simulation setup (a3fe/run/leg.py,
-lambda_window.py, simulation.py), minus the adaptive machinery.
+Leg.setup -> Leg.run_ensemble_equilibration -> Leg.setup_stages -> LambdaWindow /
+Simulation setup (a3fe/run/leg.py, lambda_window.py, simulation.py), minus the
+adaptive machinery.
 """
 import os, sys, glob, shutil, json, subprocess, yaml
 import a3fe as a3
 from a3fe.run import system_prep as sp
 from a3fe.configuration import PreparationStage
 import BioSimSpace.Sandpit.Exscientia as BSS
-from rdkit import Chem
-from rdkit.Chem import AllChem
 
-LEG, ENGINE = a3.LegType.FREE, a3.EngineType.SOMD
-STAGES = {"discharge": a3.StageType.DISCHARGE, "vanish": a3.StageType.VANISH}
+ENGINE = a3.EngineType.SOMD
+STAGE_TYPES = {"restrain": a3.StageType.RESTRAIN,
+               "discharge": a3.StageType.DISCHARGE,
+               "vanish": a3.StageType.VANISH}
+PREP_ORDER = [PreparationStage.PARAMETERISED, PreparationStage.SOLVATED,
+              PreparationStage.MINIMISED, PreparationStage.PREEQUILIBRATED]
+PREP_FNS = {PreparationStage.PARAMETERISED: sp.parameterise_input,
+            PreparationStage.SOLVATED: sp.solvate_input,
+            PreparationStage.MINIMISED: sp.minimise_input,
+            PreparationStage.PREEQUILIBRATED: sp.heat_and_preequil_input}
 
 cfg = yaml.safe_load(open(sys.argv[1]))
 base = f"{cfg['workdir']}/{cfg['name']}"
-inp = f"{base}/input"
-os.makedirs(inp, exist_ok=True)
-
-
-def have(stage):
-    """True if a3fe's output files for this preparation stage exist in inp."""
-    return all(os.path.exists(f"{inp}/{f}")
-               for f in stage.get_simulation_input_files(LEG))
-
-
-# ---- Job 1a: molecule. SMILES -> 3D structure file a3fe can read -------------
-sdf = f"{inp}/ligand.sdf"
-if not os.path.exists(sdf):
-    mol = Chem.AddHs(Chem.MolFromSmiles(cfg["smiles"]))
-    if AllChem.EmbedMolecule(mol, randomSeed=42) != 0:   # guess 3D coordinates
-        raise RuntimeError("RDKit embedding failed")
-    AllChem.MMFFOptimizeMolecule(mol)                    # clean up the geometry
-    w = Chem.SDWriter(sdf); w.write(mol); w.close()
-
-prep_cfg = a3.SomdSystemPreparationConfig(slurm=False,
-                                          ensemble_equilibration_time=cfg["equil_ps"])
-prep_cfg.dump(inp, LEG)        # a3fe's prep functions read their settings from here
-
-# ---- Job 1b–e: parameterize -> solvate -> minimize -> heat/pre-equilibrate ----
-# Skipping finished steps matters: re-solvating would change the atom count and
-# silently invalidate equilibrated coordinates that already exist.
-for stage, fn in [(PreparationStage.PARAMETERISED, sp.parameterise_input),
-                  (PreparationStage.SOLVATED, sp.solvate_input),
-                  (PreparationStage.MINIMISED, sp.minimise_input),
-                  (PreparationStage.PREEQUILIBRATED, sp.heat_and_preequil_input)]:
-    if have(stage):
-        print("skip", fn.__name__, "(done)", flush=True)
-        continue
-    print("running", fn.__name__, flush=True)
-    fn(LEG, ENGINE, inp, inp)
-
-# ---- Job 1f: one independent equilibration per replicate ---------------------
-# Free leg + SOMD: GROMACS runs in a temp dir, final coords saved as {d}/somd.rst7.
-eq_dirs = []
-for r in range(1, cfg["replicates"] + 1):
-    d = f"{base}/equil_{r}"
-    if not os.path.exists(f"{d}/somd.rst7"):
-        os.makedirs(d, exist_ok=True)
-        print(f"running ensemble equilibration {r} ({cfg['equil_ps']} ps)", flush=True)
-        sp.run_ensemble_equilibration(LEG, ENGINE, inp, d)
-    eq_dirs.append(d)
-
-# ---- Job 2: SOMD run folders, one per (stage, λ, replicate) -------------------
-# As in Leg.run_ensemble_equilibration / Leg.setup_stages: load the pre-equilibrated
-# system and mark the ligand (first molecule, named LIG) for decoupling.
-system = BSS.IO.readMolecules([f"{inp}/{f}" for f in
-                               PreparationStage.PREEQUILIBRATED.get_simulation_input_files(LEG)])
-lig = BSS.Align.decouple(system[0], intramol=True)
-system.updateMolecule(0, lig)
-lig = system[0]
-assert lig._sire_object.name().value() == "LIG", "first molecule is not the ligand"
-lig_charge = round(lig.charge().value())
-if lig_charge != 0:
-    raise NotImplementedError("charged ligand: a3fe would need co-alchemical ions + PME")
-perturbed_resnum = system.getIndex(lig) + 1
-
+legacy = "legs" not in cfg
+legs = {"free": cfg["lambda"]} if legacy else cfg["legs"]
+reps = cfg["replicates"]
 ns = float(cfg["ns_per_tape"])
-manifest = {"name": cfg["name"], "smiles": cfg["smiles"], "leg": "free",
-            "replicates": cfg["replicates"], "ns_per_tape": ns,
+
+
+def leg_dir(leg_name):
+    return base if legacy else f"{base}/{leg_name}"
+
+
+def have(inp, stage, LEG):
+    """True if a3fe's output files for this preparation stage exist in inp."""
+    return all(os.path.exists(f"{inp}/{f}") for f in stage.get_simulation_input_files(LEG))
+
+
+def stage_inputs(inp, LEG):
+    """Bring the leg's starting structures into inp: from SMILES or a3fe's example data."""
+    os.makedirs(inp, exist_ok=True)
+    if "a3fe_example" in cfg:
+        src = os.path.join(os.path.dirname(a3.__file__), "data", "example_calc_set",
+                           cfg["a3fe_example"], "input")
+        for f in PreparationStage.PREEQUILIBRATED.get_simulation_input_files(LEG):
+            if not os.path.exists(f"{inp}/{f}"):
+                shutil.copy(f"{src}/{f}", f"{inp}/{f}")
+    elif "smiles" in cfg:
+        if LEG != a3.LegType.FREE:
+            raise ValueError("a SMILES-only config can only build the free leg")
+        sdf = f"{inp}/ligand.sdf"
+        if not os.path.exists(sdf):
+            from rdkit import Chem
+            from rdkit.Chem import AllChem
+            mol = Chem.AddHs(Chem.MolFromSmiles(cfg["smiles"]))
+            if AllChem.EmbedMolecule(mol, randomSeed=42) != 0:   # guess 3D coordinates
+                raise RuntimeError("RDKit embedding failed")
+            AllChem.MMFFOptimizeMolecule(mol)                    # clean up the geometry
+            w = Chem.SDWriter(sdf); w.write(mol); w.close()
+    else:
+        raise ValueError("config needs `smiles` or `a3fe_example`")
+
+
+def search_restraint(inp, eq_dir, system, prep_cfg, LEG):
+    """Boresch restraint from one equilibration trajectory, as in
+    Leg.run_ensemble_equilibration (a3fe then uses run 1's restraint for every run)."""
+    top = f"{inp}/{PreparationStage.PREEQUILIBRATED.get_simulation_input_files(LEG)[0]}"
+    traj = BSS.Trajectory.Trajectory(topology=top, trajectory=f"{eq_dir}/gromacs.xtc",
+                                     system=system)
+    restraint = BSS.FreeEnergy.RestraintSearch.analyse(
+        method="BSS", system=system, traj=traj, work_dir=eq_dir,
+        temperature=298.15 * BSS.Units.Temperature.kelvin,
+        append_to_ligand_selection=prep_cfg.append_to_ligand_selection)
+    if restraint is None:
+        raise ValueError(f"no Boresch restraint found from {eq_dir}")
+    return restraint
+
+
+manifest = {"name": cfg["name"], "replicates": reps, "ns_per_tape": ns,
             "equil_ps": cfg["equil_ps"], "a3fe_version": a3.__version__,
-            "a3fe_lambda": {}, "lambda": {}, "runs": []}
+            "legs": {}, "runs": []}
+for k in ("smiles", "a3fe_example"):
+    if k in cfg:
+        manifest[k] = cfg[k]
 
-for name, stype in STAGES.items():
-    grid = [float(x) for x in cfg["lambda"][name]]
-    a3fe_grid = prep_cfg.lambda_values[LEG][stype]
-    assert set(a3fe_grid) <= set(grid), f"{name}: dense grid must contain a3fe's values"
-    manifest["lambda"][name] = grid
-    manifest["a3fe_lambda"][name] = a3fe_grid
+for leg_name, grids in legs.items():
+    LEG = a3.LegType[leg_name.upper()]
+    ldir = leg_dir(leg_name)
+    inp = f"{ldir}/input"
+    print(f"===== {leg_name} leg -> {ldir}", flush=True)
+    stage_inputs(inp, LEG)
 
-    # Per-stage SOMD topology + perturbation file, written by BSS exactly as a3fe
-    # does (setup_only, dummy λ/runtime, velocities dropped), then hoisted out of
-    # the lambda_* dir BSS creates.
-    sin = f"{base}/{name}/input"
-    if not all(os.path.exists(f"{sin}/{f}") for f in ("somd.prm7", "somd.pert")):
-        os.makedirs(sin, exist_ok=True)
-        print(f"writing SOMD inputs for {name} ({stype.bss_perturbation_type})", flush=True)
-        protocol = BSS.Protocol.FreeEnergy(runtime=0.001 * BSS.Units.Time.nanosecond,
-                                           lam_vals=[0.0],
-                                           perturbation_type=stype.bss_perturbation_type)
-        BSS.FreeEnergy.AlchemicalFreeEnergy(system, protocol, engine="somd",
-                                            work_dir=sin, setup_only=True,
-                                            property_map={"velocity": "foo"})
-        for f in glob.glob(f"{sin}/lambda_*/*"):
-            if not f.endswith(".cfg"):
-                shutil.copy(f, sin)
-        for dd in glob.glob(f"{sin}/lambda_*"):
-            subprocess.run(["rm", "-rf", dd], check=True)
+    prep_cfg = a3.SomdSystemPreparationConfig(slurm=False,
+                                              ensemble_equilibration_time=cfg["equil_ps"])
+    prep_cfg.dump(inp, LEG)    # a3fe's prep functions read their settings from here
+    assert set(grids) == {s.name.lower() for s in prep_cfg.required_stages[LEG]}, \
+        f"{leg_name}: config stages {sorted(grids)} != a3fe's required stages"
 
-    # Stage config = a3fe's SomdConfig defaults, with the FULL dense grid as the
-    # λ array so SOMD records u_kl at every window.
-    scfg = a3.SomdConfig()
-    scfg.set_ligand_charge(lig_charge)
-    scfg.perturbed_residue_number = perturbed_resnum
-    scfg.use_boresch_restraints = False
-    scfg.turn_on_receptor_ligand_restraints = False
-    scfg.lambda_values = grid
-    scfg.setup_lambda_arrays(stype)
-    manifest["somd"] = {"timestep_fs": scfg.timestep,
-                        "energy_frequency": scfg.energy_frequency,
-                        "sample_interval_ps": scfg.gradient_output_interval * 1000,
-                        "temperature_K": scfg.analysis_temperature,
-                        "cutoff_type": scfg.cutoff_type}
+    # ---- Job 1: parameterize -> solvate -> minimize -> heat/pre-equilibrate -------
+    # Start after the most advanced stage already present. Re-running an earlier step
+    # (e.g. re-solvating) would change the atom count and silently invalidate
+    # equilibrated coordinates that already exist.
+    done = [i for i, st in enumerate(PREP_ORDER) if have(inp, st, LEG)]
+    for st in PREP_ORDER[(max(done) + 1) if done else 0:]:
+        print("running", PREP_FNS[st].__name__, flush=True)
+        PREP_FNS[st](LEG, ENGINE, inp, inp)
 
-    for li, lam in enumerate(grid):
-        for r in range(1, cfg["replicates"] + 1):
-            rd = f"{base}/{name}/lambda_{lam:.4f}/rep_{r}"
-            manifest["runs"].append({"stage": name, "lam": lam, "lam_index": li,
-                                     "a3fe_window": lam in a3fe_grid, "rep": r,
-                                     "dir": os.path.relpath(rd, base), "ns": ns})
-            if os.path.exists(f"{rd}/simfile.dat"):
-                continue                      # already has output: don't touch it
-            os.makedirs(rd, exist_ok=True)
-            # Like LambdaWindow: link topology/coords, copy everything else.
-            for src, dst in [(f"{sin}/somd.prm7", "somd.prm7"),
-                             (f"{eq_dirs[r-1]}/somd.rst7", "somd.rst7")]:
-                if os.path.lexists(f"{rd}/{dst}"):
-                    os.remove(f"{rd}/{dst}")
-                os.symlink(os.path.relpath(src, rd), f"{rd}/{dst}")
-            shutil.copy(f"{sin}/somd.pert", f"{rd}/somd.pert")
-            scfg.write_config(run_dir=rd, lambda_val=lam, runtime=ns,
-                              top_file="somd.prm7", coord_file="somd.rst7",
-                              morph_file="somd.pert")
+    # ---- Job 1f: one independent equilibration per replicate ---------------------
+    # GROMACS, 2 fs. Coordinates land in {d}/somd.rst7; for the bound leg a3fe also
+    # keeps the trajectory ({d}/gromacs.xtc) in d, for the restraint search.
+    eq_dirs = []
+    for r in range(1, reps + 1):
+        d = f"{ldir}/equil_{r}"
+        if not os.path.exists(f"{d}/somd.rst7"):
+            os.makedirs(d, exist_ok=True)
+            print(f"running {leg_name} ensemble equilibration {r} ({cfg['equil_ps']} ps)",
+                  flush=True)
+            sp.run_ensemble_equilibration(LEG, ENGINE, inp, d)
+        eq_dirs.append(d)
+
+    # Load the pre-equilibrated system and mark the ligand (first molecule, LIG)
+    # for decoupling, as in Leg.run_ensemble_equilibration / Leg.setup_stages.
+    system = BSS.IO.readMolecules([f"{inp}/{f}" for f in
+                                   PreparationStage.PREEQUILIBRATED.get_simulation_input_files(LEG)])
+    lig = BSS.Align.decouple(system[0], intramol=True)
+    system.updateMolecule(0, lig)
+    lig = system[0]
+    assert lig._sire_object.name().value() == "LIG", "first molecule is not the ligand"
+    lig_charge = round(lig.charge().value())
+    perturbed_resnum = system.getIndex(lig) + 1
+
+    # ---- Bound leg: Boresch restraint (run 1's, used for every run, as a3fe does) --
+    restraint, restraint_info = None, None
+    if LEG == a3.LegType.BOUND:
+        rfile = f"{eq_dirs[0]}/restraint_1.txt"
+        jfile = f"{eq_dirs[0]}/restraint_1.json"
+        need_obj = not all(os.path.exists(f"{ldir}/{s}/input/somd.pert") for s in grids)
+        if need_obj or not (os.path.exists(rfile) and os.path.exists(jfile)):
+            print("searching for Boresch restraint (equil_1 trajectory)", flush=True)
+            restraint = search_restraint(inp, eq_dirs[0], system, prep_cfg, LEG)
+            with open(rfile, "w") as f:
+                f.write(restraint.toString(engine="SOMD"))
+            # Analytical correction is what a3fe adds to the bound leg's dG.
+            restraint_info = {
+                "file": os.path.relpath(rfile, base),
+                "correction_analytical_kcal": restraint.getCorrection(method="analytical").value(),
+                "correction_numerical_kcal": restraint.getCorrection(method="numerical").value()}
+            json.dump(restraint_info, open(jfile, "w"), indent=1)
+        restraint_info = json.load(open(jfile))
+        print(f"restraint correction (analytical): "
+              f"{restraint_info['correction_analytical_kcal']:.3f} kcal/mol", flush=True)
+
+    leg_man = {"lambda": {}, "a3fe_lambda": {}, "ligand_charge": lig_charge}
+    if restraint_info:
+        leg_man["restraint"] = restraint_info
+
+    # ---- Job 2: SOMD run folders, one per (stage, λ, replicate) -------------------
+    for name, grid in grids.items():
+        stype = STAGE_TYPES[name]
+        grid = [float(x) for x in grid]
+        a3fe_grid = prep_cfg.lambda_values[LEG][stype]
+        assert set(a3fe_grid) <= set(grid), f"{leg_name}/{name}: grid must contain a3fe's values"
+        leg_man["lambda"][name] = grid
+        leg_man["a3fe_lambda"][name] = a3fe_grid
+
+        # Per-stage SOMD topology + perturbation file, written by BSS exactly as a3fe
+        # does (setup_only, dummy λ/runtime, velocities dropped), then hoisted out of
+        # the lambda_* dir BSS creates.
+        sdir = f"{ldir}/{name}"
+        sin = f"{sdir}/input"
+        if not all(os.path.exists(f"{sin}/{f}") for f in ("somd.prm7", "somd.pert")):
+            os.makedirs(sin, exist_ok=True)
+            print(f"writing SOMD inputs for {leg_name}/{name} ({stype.bss_perturbation_type})",
+                  flush=True)
+            protocol = BSS.Protocol.FreeEnergy(runtime=0.001 * BSS.Units.Time.nanosecond,
+                                               lam_vals=[0.0],
+                                               perturbation_type=stype.bss_perturbation_type)
+            BSS.FreeEnergy.AlchemicalFreeEnergy(system, protocol, engine="somd",
+                                                restraint=restraint,
+                                                work_dir=sin, setup_only=True,
+                                                property_map={"velocity": "foo"})
+            for f in glob.glob(f"{sin}/lambda_*/*"):
+                if not f.endswith(".cfg"):
+                    shutil.copy(f, sin)
+            for dd in glob.glob(f"{sin}/lambda_*"):
+                subprocess.run(["rm", "-rf", dd], check=True)
+
+        # Stage config = a3fe's SomdConfig defaults, with the FULL dense grid as the
+        # λ array so SOMD records u_kl at every window of this stage.
+        scfg = a3.SomdConfig()
+        scfg.set_ligand_charge(lig_charge)
+        if lig_charge != 0:
+            # SOMD's charged-ligand correction requires PME (a3fe validates this);
+            # a3fe's Leg.setup_stages suggests e.g. a 10 Å cutoff.
+            scfg.cutoff_type = "PME"
+            scfg.cutoff_distance = float(cfg.get("cutoff_distance", 10.0))
+        if "energy_frequency" in cfg:
+            scfg.energy_frequency = int(cfg["energy_frequency"])
+        if "buffered_coords_freq" in cfg:
+            scfg.buffered_coords_freq = int(cfg["buffered_coords_freq"])
+        scfg.perturbed_residue_number = perturbed_resnum
+        scfg.use_boresch_restraints = LEG == a3.LegType.BOUND
+        scfg.turn_on_receptor_ligand_restraints = (LEG == a3.LegType.BOUND
+                                                   and stype == a3.StageType.RESTRAIN)
+        if LEG == a3.LegType.BOUND:
+            scfg.load_boresch_restraints(f"{eq_dirs[0]}/restraint_1.txt")
+        scfg.lambda_values = grid
+        scfg.setup_lambda_arrays(stype)
+        leg_man["somd"] = {"timestep_fs": scfg.timestep,
+                           "energy_frequency": scfg.energy_frequency,
+                           "sample_interval_ps": scfg.gradient_output_interval * 1000,
+                           "temperature_K": scfg.analysis_temperature,
+                           "cutoff_type": scfg.cutoff_type,
+                           "cutoff_distance_A": scfg.cutoff_distance,
+                           "ligand_charge_option": scfg.ligand_charge}
+
+        for li, lam in enumerate(grid):
+            for r in range(1, reps + 1):
+                rd = f"{sdir}/lambda_{lam:.4f}/rep_{r}"
+                manifest["runs"].append({"leg": leg_name, "stage": name, "lam": lam,
+                                         "lam_index": li, "a3fe_window": lam in a3fe_grid,
+                                         "rep": r, "dir": os.path.relpath(rd, base), "ns": ns})
+                if os.path.exists(f"{rd}/simfile.dat"):
+                    continue                      # already has output: don't touch it
+                os.makedirs(rd, exist_ok=True)
+                # Like LambdaWindow: link topology/coords, copy everything else.
+                for src, dst in [(f"{sin}/somd.prm7", "somd.prm7"),
+                                 (f"{eq_dirs[r-1]}/somd.rst7", "somd.rst7")]:
+                    if os.path.lexists(f"{rd}/{dst}"):
+                        os.remove(f"{rd}/{dst}")
+                    os.symlink(os.path.relpath(src, rd), f"{rd}/{dst}")
+                shutil.copy(f"{sin}/somd.pert", f"{rd}/somd.pert")
+                scfg.write_config(run_dir=rd, lambda_val=lam, runtime=ns,
+                                  top_file="somd.prm7", coord_file="somd.rst7",
+                                  morph_file="somd.pert")
+    manifest["legs"][leg_name] = leg_man
+
+# Legacy single-free-leg manifests keep their old top-level keys, which
+# notebooks/replay.ipynb reads (lambda, a3fe_lambda, somd, leg).
+if legacy:
+    fl = manifest["legs"]["free"]
+    manifest.update({"leg": "free", "lambda": fl["lambda"],
+                     "a3fe_lambda": fl["a3fe_lambda"], "somd": fl["somd"]})
 
 with open(f"{base}/manifest.json", "w") as f:
     json.dump(manifest, f, indent=1)
