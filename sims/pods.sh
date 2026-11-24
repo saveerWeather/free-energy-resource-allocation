@@ -51,7 +51,8 @@ copy-prep)
         stamp "push prep tree -> $label"
         $SSH -n -p "$port" "root@$ip" "mkdir -p /workspace/runs/$name"
         rsync -az -e "$SSH -p $port" "${PREP_EXCLUDES[@]}" "$stage/" \
-            "root@$ip:/workspace/runs/$name/" < /dev/null
+            "root@$ip:/workspace/runs/$name/" < /dev/null \
+            && $SSH -n -p "$port" "root@$ip" "touch /workspace/runs/$name/PREP_READY"
     done ;;
 pull)
     podsfile=$1; name=$2; every=${3:-1800}

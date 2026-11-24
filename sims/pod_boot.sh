@@ -11,6 +11,10 @@
 #   FERA_RUNS     run.py argument sets separated by "|", run in order after prep.
 #                 Default = the MDM2 pilot: 4 bound-vanish + 2 free-vanish tapes of rep 1.
 #   FERA_GRACE_MIN  minutes to stay up after finishing, so tapes can be pulled (default 60)
+#   FERA_WAIT_PREP=1  don't run prep here: wait until a finished prep tree has been
+#                 pushed in (sims/pods.sh copy-prep writes its manifest.json last-ish;
+#                 we wait for the marker file PREP_READY), so every replicate uses the
+#                 same equilibrations and restraint.
 #   RUNPOD_API_KEY  set from a RunPod secret ({{ RUNPOD_SECRET_<name> }}); without it the
 #                 pod can NOT stop itself and keeps billing until stopped by hand.
 REPO=/workspace/free-energy-resource-allocation
@@ -38,6 +42,13 @@ stamp "code at $(git -C "$REPO" rev-parse --short HEAD)"
 bash "$REPO/sims/pod_setup.sh" || stamp "WARNING: pod_setup.sh exited $?"
 
 first=1
+if [ "${FERA_WAIT_PREP:-0}" = 1 ]; then
+    NAME=$(grep -E '^name:' "$REPO/$CFG" | awk '{print $2}')
+    stamp "waiting for prep tree at /workspace/runs/$NAME/PREP_READY"
+    until [ -f "/workspace/runs/$NAME/PREP_READY" ]; do sleep 30; done
+    stamp "prep tree present"
+    first=0
+fi
 IFS='|' read -ra SETS <<< "$RUNS"
 for args in "${SETS[@]}"; do
     stamp "recording: run.py $args"
