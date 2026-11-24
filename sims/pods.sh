@@ -8,6 +8,7 @@
 #
 #   sims/pods.sh push-code  <podsfile>                 # repo -> /workspace on every pod
 #   sims/pods.sh copy-prep  <podsfile> <name> <label>  # finished prep tree: pod <label> -> laptop -> others
+#                                                      # (<label> = "-": push data/<name>/_prep as it is)
 #   sims/pods.sh pull       <podsfile> <name> [secs]   # tapes -> data/<name>/, every secs (default 1800)
 #   sims/pods.sh status     <podsfile> <name>          # last lines of each pod's run log
 #
@@ -35,9 +36,6 @@ copy-prep)
     podsfile=$1; name=$2; src=$3
     stage=data/$name/_prep
     mkdir -p "$stage"
-    read -r _ sip sport < <(pods "$podsfile" | awk -v l="$src" '$1 == l')
-    [ -n "${sip:-}" ] || { echo "no pod labelled $src in $podsfile"; exit 1; }
-    stamp "pull prep tree <- $src"
     # Everything prep wrote (inputs, equilibrations, restraint, run folders with their
     # cfg/pert/symlinks), none of the recording outputs.
     PREP_EXCLUDES=(--exclude 'simfile*.dat' --exclude 'somd.out' --exclude 'somd.err'
@@ -46,8 +44,14 @@ copy-prep)
                    --exclude 'run_log*.jsonl' --exclude 'overnight_*.log'
                    --exclude '*.xtc' --exclude '*.trr' --exclude '*.edr' --exclude '*.cpt'
                    --exclude '*_smoke')
-    rsync -az -e "$SSH -p $sport" "${PREP_EXCLUDES[@]}" \
-        "root@$sip:/workspace/runs/$name/" "$stage/" < /dev/null
+    if [ "$src" != "-" ]; then
+        read -r _ sip sport < <(pods "$podsfile" | awk -v l="$src" '$1 == l')
+        [ -n "${sip:-}" ] || { echo "no pod labelled $src in $podsfile"; exit 1; }
+        stamp "pull prep tree <- $src"
+        rsync -az -e "$SSH -p $sport" "${PREP_EXCLUDES[@]}" \
+            "root@$sip:/workspace/runs/$name/" "$stage/" < /dev/null || exit 1
+    fi
+    [ -f "$stage/manifest.json" ] || { echo "no prep tree at $stage"; exit 1; }
     # Pushes run concurrently; PREP_READY is touched only after a pod's rsync succeeded.
     pods "$podsfile" | { while read -r label ip port; do
         [ "$label" = "$src" ] && continue
@@ -90,5 +94,5 @@ status)
         $SSH -n -p "$port" "root@$ip" "tail -n 3 /workspace/runs/$2/overnight_*.log 2>/dev/null || echo 'no log yet'"
     done ;;
 *)
-    sed -n '2,16p' "$0"; exit 1 ;;
+    sed -n '2,17p' "$0"; exit 1 ;;
 esac
