@@ -33,6 +33,7 @@ if [ ! -d "$MAMBA_ROOT_PREFIX/envs/fera" ]; then
     sed "s/cuda-version=[0-9.]*/cuda-version=${drv:-13.2}/" "$REPO/environment.yml" > /tmp/fera_env.yml
     stamp "creating env fera (cuda-version=${drv:-13.2}, host driver CUDA ${drv:-unknown}; ~10-20 min)"
     micromamba create -y -f /tmp/fera_env.yml
+    micromamba clean -a -y -q   # drop the package cache (most of the 41 GB toluene's took)
 fi
 micromamba activate fera
 
