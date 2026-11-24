@@ -68,7 +68,10 @@ pull)
     while true; do
         pods "$podsfile" | while read -r label ip port; do
             # Tapes + what's needed to read them; no trajectories or restart files.
-            if rsync -az -e "$SSH -p $port" --prune-empty-dirs \
+            # --update: never replace a newer local file with an older remote one, so a
+            # stale/partial copy of a tape on one pod (e.g. pushed for skip-detection, or
+            # a killed run) can't clobber the complete copy pulled from another pod.
+            if rsync -az --update -e "$SSH -p $port" --prune-empty-dirs \
                 --include '*/' --include 'manifest.json' --include 'run_log*.jsonl' \
                 --include 'overnight_*.log' --include 'simfile.dat' --include 'somd.cfg' \
                 --include 'somd.out' --include 'somd.err' --include 'restraint_1.*' \
