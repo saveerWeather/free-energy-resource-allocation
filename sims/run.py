@@ -28,6 +28,8 @@ ap.add_argument("--stage", choices=["restrain", "discharge", "vanish"])
 ap.add_argument("--lam", type=float, help="only this λ value")
 ap.add_argument("--rep", type=int, help="only this replicate")
 ap.add_argument("--max-runs", type=int, help="stop after launching this many")
+ap.add_argument("--shard", help="K/M: keep every M-th selected run starting at K (0-based), "
+                "to split one selection across M pods")
 ap.add_argument("--dry-run", action="store_true")
 args = ap.parse_args()
 
@@ -76,6 +78,9 @@ runs = [r for r in runs
         and (args.stage is None or r["stage"] == args.stage)
         and (args.lam is None or abs(r["lam"] - args.lam) < 1e-9)
         and (args.rep is None or r["rep"] == args.rep)]
+if args.shard:
+    k, m = map(int, args.shard.split("/"))
+    runs = runs[k::m]     # runs is sorted, so shards interleave legs/stages/λ evenly
 todo = [r for r in runs if not is_done(r)]
 if args.max_runs is not None:
     todo = todo[:args.max_runs]
@@ -89,7 +94,7 @@ if args.dry_run or not todo:
 procs, lock, stopping = set(), threading.Lock(), threading.Event()
 # One log per pod, so logs from pods recording different replicates don't collide
 # when they're pulled into one folder.
-pod = os.environ.get("RUNPOD_POD_ID")
+pod = os.environ.get("RUNPOD_POD_ID") or os.environ.get("CONTAINER_ID")   # RunPod / Vast
 log_path = f"{base}/run_log_{pod}.jsonl" if pod else f"{base}/run_log.jsonl"
 
 

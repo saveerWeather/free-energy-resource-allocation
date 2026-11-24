@@ -24,13 +24,13 @@ cd "$REPO"
 # Log next to the run folders, one file per pod. (Name read with the env's python,
 # which has pyyaml; the pod image's system python may not.)
 NAME=$(python -c "import yaml; print(yaml.safe_load(open('$CFG'))['name'])")
-LOG=/workspace/runs/$NAME/overnight_${RUNPOD_POD_ID:-local}.log
+LOG=/workspace/runs/$NAME/overnight_${RUNPOD_POD_ID:-${CONTAINER_ID:-local}}.log
 mkdir -p "$(dirname "$LOG")"
 exec >> "$LOG" 2>&1
 
 stamp() { echo "[$(date '+%F %T')] $*"; }
 
-stamp "start (pod ${RUNPOD_POD_ID:-?}, config $CFG, run args: $*)"
+stamp "start (pod ${RUNPOD_POD_ID:-${CONTAINER_ID:-?}}, config $CFG, run args: $*)"
 stamp "python $(which python) | somd $(which somd-freenrg) | gmx $(which gmx)"
 if ! runpodctl get pod "$RUNPOD_POD_ID" > /dev/null 2>&1; then
     stamp "WARNING: runpodctl is not authorized right now; the final 'stop pod' may fail."

@@ -31,7 +31,7 @@ GRACE=${FERA_GRACE_MIN:-60}
 FAIL_GRACE=${FERA_FAIL_GRACE_MIN:-240}
 
 stamp() { echo "[$(date '+%F %T')] $*"; }
-stamp "boot: pod ${RUNPOD_POD_ID:-?}, branch $BRANCH, config $CFG"
+stamp "boot: pod ${RUNPOD_POD_ID:-${CONTAINER_ID:-?}}, branch $BRANCH, config $CFG"
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
 
 if [ -n "${RUNPOD_API_KEY:-}" ]; then
