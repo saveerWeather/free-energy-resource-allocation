@@ -29,9 +29,14 @@ if [ ! -d "$MAMBA_ROOT_PREFIX/envs/fera" ]; then
     # environment.yml pins cuda-version=13.2 (the toluene host's driver). The pin must
     # not exceed this host's driver CUDA, or OpenMM's CUDA platform fails
     # (CUDA_ERROR_UNSUPPORTED_PTX_VERSION), so re-pin it to the driver's version.
+    # Pin = min(driver CUDA, 13.2): 13.2 is the version known to solve and run (13.5 broke
+    # OpenMM's CUDA platform); below ~13 the openbiosim dev packages don't solve at all,
+    # so only rent hosts whose driver reports CUDA >= 13.2.
     drv=$(nvidia-smi | grep -oP 'CUDA Version: \K[0-9]+\.[0-9]+' || true)
-    sed "s/cuda-version=[0-9.]*/cuda-version=${drv:-13.2}/" "$REPO/environment.yml" > /tmp/fera_env.yml
-    stamp "creating env fera (cuda-version=${drv:-13.2}, host driver CUDA ${drv:-unknown}; ~10-20 min)"
+    pin=$(python3 -c "import sys; d=sys.argv[1]; print(min(d, '13.2', key=lambda v: tuple(map(int, v.split('.')))) if d else '13.2')" "$drv" 2>/dev/null || echo 13.2)
+    drv_note=$drv
+    sed "s/cuda-version=[0-9.]*/cuda-version=${pin}/" "$REPO/environment.yml" > /tmp/fera_env.yml
+    stamp "creating env fera (cuda-version=${pin}, host driver CUDA ${drv_note:-unknown}; ~10-20 min)"
     micromamba create -y -f /tmp/fera_env.yml
     micromamba clean -a -y -q   # drop the package cache (most of the 41 GB toluene's took)
 fi
