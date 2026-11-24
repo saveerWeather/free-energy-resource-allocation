@@ -141,8 +141,18 @@ for leg_name, grids in legs.items():
         for i, (r, d) in enumerate(todo):
             os.makedirs(d, exist_ok=True)
             mine = cpus[i * per:(i + 1) * per]
-            env = dict(os.environ, OMP_NUM_THREADS=str(max(1, per // 4)))
+            ntomp = 4
+            env = dict(os.environ, OMP_NUM_THREADS=str(ntomp))
+            # mdrun ignores the taskset mask when sizing itself, and BSS passes no
+            # thread flags, so add them (and -pin off, or all copies pin to cores 0..N).
             code = ("import a3fe as a3; from a3fe.run import system_prep as sp; "
+                    "import BioSimSpace.Sandpit.Exscientia as BSS; "
+                    "G = BSS.Process.Gromacs; _ga = G._generate_args\n"
+                    "def ga(self):\n"
+                    "    _ga(self)\n"
+                    f"    self.setArg('-ntmpi', {max(1, per // ntomp)}); "
+                    f"self.setArg('-ntomp', {ntomp}); self.setArg('-pin', 'off')\n"
+                    "G._generate_args = ga\n"
                     f"sp.run_ensemble_equilibration(a3.LegType.{LEG.name}, "
                     f"a3.EngineType.{ENGINE.name}, {inp!r}, {d!r})")
             print(f"running {leg_name} ensemble equilibration {r} ({cfg['equil_ps']} ps) "
