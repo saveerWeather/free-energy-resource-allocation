@@ -43,17 +43,24 @@ copy-prep)
     PREP_EXCLUDES=(--exclude 'simfile*.dat' --exclude 'somd.out' --exclude 'somd.err'
                    --exclude '*.dcd' --exclude '*.s3' --exclude '*.s3.previous'
                    --exclude 'moves.dat' --exclude 'gradients.dat' --exclude 'latest.pdb'
-                   --exclude 'run_log*.jsonl' --exclude 'overnight_*.log')
+                   --exclude 'run_log*.jsonl' --exclude 'overnight_*.log'
+                   --exclude '*.xtc' --exclude '*.trr' --exclude '*.edr' --exclude '*.cpt'
+                   --exclude '*_smoke')
     rsync -az -e "$SSH -p $sport" "${PREP_EXCLUDES[@]}" \
         "root@$sip:/workspace/runs/$name/" "$stage/" < /dev/null
-    pods "$podsfile" | while read -r label ip port; do
+    # Pushes run concurrently; PREP_READY is touched only after a pod's rsync succeeded.
+    pods "$podsfile" | { while read -r label ip port; do
         [ "$label" = "$src" ] && continue
-        stamp "push prep tree -> $label"
-        $SSH -n -p "$port" "root@$ip" "mkdir -p /workspace/runs/$name"
-        rsync -az -e "$SSH -p $port" "${PREP_EXCLUDES[@]}" "$stage/" \
-            "root@$ip:/workspace/runs/$name/" < /dev/null \
-            && $SSH -n -p "$port" "root@$ip" "touch /workspace/runs/$name/PREP_READY"
-    done ;;
+        (
+            stamp "push prep tree -> $label"
+            $SSH -n -p "$port" "root@$ip" "mkdir -p /workspace/runs/$name" \
+            && rsync -az -e "$SSH -p $port" "${PREP_EXCLUDES[@]}" "$stage/" \
+                "root@$ip:/workspace/runs/$name/" < /dev/null \
+            && $SSH -n -p "$port" "root@$ip" "touch /workspace/runs/$name/PREP_READY" \
+            && stamp "prep ready on $label" || stamp "WARNING: prep push to $label failed"
+        ) &
+    done
+    wait; } ;;   # wait inside the pipeline's subshell, where the jobs live
 pull)
     podsfile=$1; name=$2; every=${3:-1800}
     dest=data/$name
