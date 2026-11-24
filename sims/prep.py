@@ -128,15 +128,39 @@ for leg_name, grids in legs.items():
     # ---- Job 1f: one independent equilibration per replicate ---------------------
     # GROMACS, 2 fs. Coordinates land in {d}/somd.rst7; for the bound leg a3fe also
     # keeps the trajectory ({d}/gromacs.xtc) in d, for the restraint search.
-    eq_dirs = []
-    for r in range(1, reps + 1):
-        d = f"{ldir}/equil_{r}"
-        if not os.path.exists(f"{d}/somd.rst7"):
+    # The replicates' equilibrations are independent, and one mdrun scales poorly past
+    # ~16 cores, so on a many-core host they run concurrently, each in its own python
+    # process pinned (taskset) to a disjoint slice of cores; mdrun sizes itself to its
+    # affinity mask. With few cores this degenerates to one at a time.
+    eq_dirs = [f"{ldir}/equil_{r}" for r in range(1, reps + 1)]
+    todo = [(r, d) for r, d in enumerate(eq_dirs, 1) if not os.path.exists(f"{d}/somd.rst7")]
+    cpus = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else []
+    per = len(cpus) // max(1, len(todo)) if todo else 0
+    if todo and per >= 8 and len(todo) > 1:
+        procs = []
+        for i, (r, d) in enumerate(todo):
+            os.makedirs(d, exist_ok=True)
+            mine = cpus[i * per:(i + 1) * per]
+            env = dict(os.environ, OMP_NUM_THREADS=str(max(1, per // 4)))
+            code = ("import a3fe as a3; from a3fe.run import system_prep as sp; "
+                    f"sp.run_ensemble_equilibration(a3.LegType.{LEG.name}, "
+                    f"a3.EngineType.{ENGINE.name}, {inp!r}, {d!r})")
+            print(f"running {leg_name} ensemble equilibration {r} ({cfg['equil_ps']} ps) "
+                  f"on {len(mine)} cores, concurrently", flush=True)
+            log = open(f"{d}/equil_driver.log", "w")
+            procs.append((r, subprocess.Popen(
+                ["taskset", "-c", ",".join(map(str, mine)), sys.executable, "-c", code],
+                env=env, stdout=log, stderr=subprocess.STDOUT)))
+        bad = [r for r, p in procs if p.wait() != 0]
+        if bad:
+            raise RuntimeError(f"{leg_name} equilibration(s) {bad} failed; "
+                               f"see {ldir}/equil_*/equil_driver.log")
+    else:
+        for r, d in todo:
             os.makedirs(d, exist_ok=True)
             print(f"running {leg_name} ensemble equilibration {r} ({cfg['equil_ps']} ps)",
                   flush=True)
             sp.run_ensemble_equilibration(LEG, ENGINE, inp, d)
-        eq_dirs.append(d)
 
     # Load the pre-equilibrated system and mark the ligand (first molecule, LIG)
     # for decoupling, as in Leg.run_ensemble_equilibration / Leg.setup_stages.
