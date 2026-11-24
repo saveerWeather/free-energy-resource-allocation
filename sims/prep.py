@@ -17,6 +17,12 @@ Simulation setup (a3fe/run/leg.py, lambda_window.py, simulation.py), minus the
 adaptive machinery.
 """
 import os, sys, glob, shutil, json, subprocess, yaml
+# GROMACS (run by BSS as plain `gmx mdrun`, no -nt) starts one thread-MPI rank per core.
+# On many-core hosts that gives rank counts like 62 (= 2·31), which mdrun rejects
+# ("large prime factor"). Capping at ~16 ranks with several OpenMP threads each keeps
+# the domain decomposition sane on any core count; mdrun reads -ntomp from here.
+_ncpu = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
+os.environ.setdefault("OMP_NUM_THREADS", str(max(1, _ncpu // 16)))
 import a3fe as a3
 from a3fe.run import system_prep as sp
 from a3fe.configuration import PreparationStage
