@@ -15,13 +15,20 @@
 #                 pushed in (sims/pods.sh copy-prep writes its manifest.json last-ish;
 #                 we wait for the marker file PREP_READY), so every replicate uses the
 #                 same equilibrations and restraint.
-#   RUNPOD_API_KEY  set from a RunPod secret ({{ RUNPOD_SECRET_<name> }}); without it the
-#                 pod can NOT stop itself and keeps billing until stopped by hand.
+#   FERA_SMOKE=1  before the real prep, run the whole pipeline on a throwaway copy of the
+#                 config (20 ps equilibrations, 2 replicates, one 0.02 ns tape per leg)
+#                 so a crash in a late prep step shows up in minutes, not hours (default 1;
+#                 skipped on pods that wait for a pushed prep tree).
+#   FERA_FAIL_GRACE_MIN  if any step fails, stay up this long so the logs can be read
+#                 before stopping (default 240).
+#   The pod stops itself with `runpodctl stop` using the pod-scoped API key RunPod puts
+#   in every pod (RUNPOD_API_KEY); it is NOT left running when the work is done.
 REPO=/workspace/free-energy-resource-allocation
 BRANCH=${FERA_BRANCH:-main}
 CFG=${FERA_CONFIG:-configs/mdm2.yaml}
 RUNS=${FERA_RUNS:-"--rep 1 --leg bound --stage vanish --max-runs 4|--rep 1 --leg free --stage vanish --max-runs 2"}
 GRACE=${FERA_GRACE_MIN:-60}
+FAIL_GRACE=${FERA_FAIL_GRACE_MIN:-240}
 
 stamp() { echo "[$(date '+%F %T')] $*"; }
 stamp "boot: pod ${RUNPOD_POD_ID:-?}, branch $BRANCH, config $CFG"
@@ -41,7 +48,32 @@ stamp "code at $(git -C "$REPO" rev-parse --short HEAD)"
 
 bash "$REPO/sims/pod_setup.sh" || stamp "WARNING: pod_setup.sh exited $?"
 
+fail() {   # stay up so the logs can be read, then stop
+    stamp "FAILED: $*; staying up ${FAIL_GRACE} min for debugging"
+    touch /workspace/FAILED
+    sleep "$((FAIL_GRACE * 60))"
+    stamp "stopping pod (after failure)"
+    runpodctl stop pod "$RUNPOD_POD_ID"
+    exit 1
+}
+rm -f /workspace/FAILED
+
 first=1
+if [ "${FERA_SMOKE:-1}" = 1 ] && [ "${FERA_WAIT_PREP:-0}" != 1 ]; then
+    SMOKE_CFG=/workspace/smoke.yaml
+    /workspace/mamba/envs/fera/bin/python - "$REPO/$CFG" "$SMOKE_CFG" <<'PY'
+import sys, yaml
+c = yaml.safe_load(open(sys.argv[1]))
+c.update(name=c["name"] + "_smoke", replicates=2, equil_ps=20, ns_per_tape=0.02,
+         energy_frequency=1000, buffered_coords_freq=1000)
+yaml.safe_dump(c, open(sys.argv[2], "w"))
+PY
+    stamp "smoke test: prep + 1 tape per leg on $SMOKE_CFG"
+    PREP=1 STOP_POD=0 bash "$REPO/sims/overnight.sh" "$SMOKE_CFG" --rep 1 --leg bound --stage vanish --max-runs 1 \
+        && PREP=0 STOP_POD=0 bash "$REPO/sims/overnight.sh" "$SMOKE_CFG" --rep 1 --leg free --stage vanish --max-runs 1 \
+        || fail "smoke test (log: /workspace/runs/*_smoke/overnight_*.log)"
+    stamp "smoke test passed"
+fi
 if [ "${FERA_WAIT_PREP:-0}" = 1 ]; then
     NAME=$(grep -E '^name:' "$REPO/$CFG" | awk '{print $2}')
     stamp "waiting for prep tree at /workspace/runs/$NAME/PREP_READY"
@@ -55,7 +87,8 @@ for args in "${SETS[@]}"; do
     # Prep only before the first set (it's resumable either way); overnight.sh logs
     # to /workspace/runs/<name>/overnight_<pod>.log.
     # shellcheck disable=SC2086
-    PREP=$first STOP_POD=0 bash "$REPO/sims/overnight.sh" "$CFG" $args
+    PREP=$first STOP_POD=0 bash "$REPO/sims/overnight.sh" "$CFG" $args \
+        || fail "run.py $args (log: /workspace/runs/*/overnight_*.log)"
     first=0
 done
 

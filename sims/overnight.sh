@@ -9,7 +9,8 @@
 # pod). Prep runs only when PREP=1 (default) and is skipped per step if done, so on
 # pods that received a finished prep tree it only re-checks the folders.
 # Re-running is safe: prep and run.py both skip finished work.
-# No `set -e`: the pod is stopped at the end whether or not a step failed.
+# No `set -e`: every step is logged; exits nonzero if prep or run.py failed (run.py is
+# skipped when prep failed).
 
 REPO=/workspace/free-energy-resource-allocation
 CFG=${1:-configs/toluene.yaml}
@@ -36,17 +37,25 @@ if ! runpodctl get pod "$RUNPOD_POD_ID" > /dev/null 2>&1; then
     stamp "WARNING: fix before the run ends with: runpodctl config --apiKey <key>"
 fi
 
+status=0
 if [ "${PREP:-1}" = 1 ]; then
     stamp "prep: begin"
     python -u sims/prep.py "$CFG"
-    stamp "prep: exit $?"
+    rc=$?; stamp "prep: exit $rc"
+    [ $rc = 0 ] || status=$rc
 fi
 
-stamp "run: begin"
-python -u sims/run.py "$CFG" --jobs 1 "$@"
-stamp "run: exit $?"
+if [ $status = 0 ]; then
+    stamp "run: begin"
+    python -u sims/run.py "$CFG" --jobs 1 "$@"
+    rc=$?; stamp "run: exit $rc"
+    [ $rc = 0 ] || status=$rc
+else
+    stamp "run: skipped (prep failed)"
+fi
 
 if [ "${STOP_POD:-1}" = 1 ]; then
     stamp "stopping pod"
     runpodctl stop pod "$RUNPOD_POD_ID"
 fi
+exit $status
