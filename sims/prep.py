@@ -208,12 +208,14 @@ for leg_name, grids in legs.items():
         # Stage config = a3fe's SomdConfig defaults, with the FULL dense grid as the
         # λ array so SOMD records u_kl at every window of this stage.
         scfg = a3.SomdConfig()
-        scfg.set_ligand_charge(lig_charge)
         if lig_charge != 0:
             # SOMD's charged-ligand correction requires PME (a3fe validates this);
-            # a3fe's Leg.setup_stages suggests e.g. a 10 Å cutoff.
+            # a3fe's Leg.setup_stages suggests e.g. a 10 Å cutoff. SomdConfig
+            # re-validates the whole model on every assignment, so PME must be set
+            # BEFORE the charge, or the intermediate state (charge, no PME) is rejected.
             scfg.cutoff_type = "PME"
             scfg.cutoff_distance = float(cfg.get("cutoff_distance", 10.0))
+        scfg.set_ligand_charge(lig_charge)
         if "energy_frequency" in cfg:
             scfg.energy_frequency = int(cfg["energy_frequency"])
         if "buffered_coords_freq" in cfg:
