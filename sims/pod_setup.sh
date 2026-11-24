@@ -9,7 +9,7 @@
 # terminate. Re-running is safe: each step is skipped if already done.
 # Needs a host driver with CUDA >= 13.2 (environment.yml pins cuda-version=13.2), so
 # create GPU pods with minCudaVersion 13.2.
-set -euo pipefail
+set -eo pipefail   # no -u: micromamba activation hooks reference unset vars
 
 REPO=/workspace/free-energy-resource-allocation
 export MAMBA_ROOT_PREFIX=/workspace/mamba
