@@ -16,12 +16,25 @@ Leg.setup -> Leg.run_ensemble_equilibration -> Leg.setup_stages -> LambdaWindow 
 Simulation setup (a3fe/run/leg.py, lambda_window.py, simulation.py), minus the
 adaptive machinery.
 """
-import os, sys, glob, shutil, json, subprocess, yaml
+import os, sys, glob, shutil, json, subprocess, time, yaml
 # GROMACS (run by BSS as plain `gmx mdrun`, no -nt) starts one thread-MPI rank per core.
 # On many-core hosts that gives rank counts like 62 (= 2·31), which mdrun rejects
 # ("large prime factor"). Capping at ~16 ranks with several OpenMP threads each keeps
 # the domain decomposition sane on any core count; mdrun reads -ntomp from here.
-_ncpu = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
+def _usable_cores():
+    """Cores we may actually use: the affinity mask, capped by a cgroup CPU quota (Vast
+    containers see all of the host's cores but are throttled to their rented share)."""
+    n = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
+    try:
+        q, period = open("/sys/fs/cgroup/cpu.max").read().split()
+        if q != "max":
+            n = min(n, max(1, int(int(q) / int(period))))
+    except (OSError, ValueError):
+        pass
+    return n
+
+
+_ncpu = _usable_cores()
 os.environ.setdefault("OMP_NUM_THREADS", str(max(1, _ncpu // 16)))
 import a3fe as a3
 from a3fe.run import system_prep as sp
@@ -134,7 +147,7 @@ for leg_name, grids in legs.items():
     # affinity mask. With few cores this degenerates to one at a time.
     eq_dirs = [f"{ldir}/equil_{r}" for r in range(1, reps + 1)]
     todo = [(r, d) for r, d in enumerate(eq_dirs, 1) if not os.path.exists(f"{d}/somd.rst7")]
-    cpus = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else []
+    cpus = (sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else [])[:_ncpu]
     per = len(cpus) // max(1, len(todo)) if todo else 0
     if todo and per >= 8 and len(todo) > 1:
         procs = []
@@ -161,6 +174,9 @@ for leg_name, grids in legs.items():
             procs.append((r, subprocess.Popen(
                 ["taskset", "-c", ",".join(map(str, mine)), sys.executable, "-c", code],
                 env=env, stdout=log, stderr=subprocess.STDOUT)))
+            # Stagger starts: simultaneous `import a3fe` calls race on arviz's
+            # once-a-day stamp file in ~/.cache/arviz and one of them crashes.
+            time.sleep(20)
         bad = [r for r, p in procs if p.wait() != 0]
         if bad:
             raise RuntimeError(f"{leg_name} equilibration(s) {bad} failed; "
